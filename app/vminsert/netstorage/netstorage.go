@@ -151,6 +151,7 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	var br bufRows
+	var chunk bufRows
 	brLastResetTime := fasttime.UnixTimestamp()
 	var waitCh <-chan struct{}
 	mustStop := false
@@ -173,30 +174,57 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 		}
 		sn.brLock.Lock()
 		sn.br, br = br, sn.br
+		bufLen = len(br.buf)
 		sn.brCond.Broadcast()
 		sn.brLock.Unlock()
 		currentTime := fasttime.UnixTimestamp()
-		if len(br.buf) < cap(br.buf)/4 && currentTime-brLastResetTime > 10 {
+		if bufLen < cap(br.buf)/4 && currentTime-brLastResetTime > 10 {
 			// Free up capacity space occupied by br.buf in order to reduce memory usage after spikes.
 			br.buf = append(br.buf[:0:0], br.buf...)
 			brLastResetTime = currentTime
 		}
 		sn.checkHealth()
-		if len(br.buf) == 0 {
-			// Nothing to send.
-			continue
-		}
-		// Send br to replicas storage nodes starting from snIdx.
-		for !sendBufToReplicasNonblocking(snb, &br, snIdx, replicas) {
-			t := timerpool.Get(200 * time.Millisecond)
-			select {
-			case <-sn.stopCh:
-				timerpool.Put(t)
-				return
-			case <-t.C:
-				timerpool.Put(t)
-				sn.checkHealth()
+		// Split buf into chunks.
+		chunkSize := consts.MaxInsertPacketSizeForVMInsert
+		for bufLen > 0 {
+			if chunkSize > bufLen {
+				chunk = br
+				br.reset()
+			} else {
+				// Copy rows into chunk until chunk size is reached.
+				var mr storage.MetricRow
+				src := br.buf
+				chunk.reset()
+				for len(chunk.buf) < chunkSize {
+					tail, err := mr.UnmarshalX(src)
+					mr.ResetX()
+					if err != nil {
+						logger.Panicf("BUG: cannot unmarshal MetricRow: %s", err)
+					}
+					rowBuf := src[:len(src)-len(tail)]
+					src = tail
+					chunk.buf = append(chunk.buf, rowBuf...)
+					chunk.rows++
+					br.rows--
+				}
+				br.buf = src
+				logger.Infof("Split chunk, size=%d bytes, %d rows. Remaining %d bytes, %d rows", len(chunk.buf), chunk.rows, len(br.buf), br.rows)
 			}
+
+			// Send chunk to replicas storage nodes starting from snIdx.
+			for !sendBufToReplicasNonblocking(snb, &chunk, snIdx, replicas) {
+				t := timerpool.Get(200 * time.Millisecond)
+				select {
+				case <-sn.stopCh:
+					timerpool.Put(t)
+					return
+				case <-t.C:
+					timerpool.Put(t)
+					sn.checkHealth()
+				}
+			}
+			chunk.reset()
+			bufLen = len(br.buf)
 		}
 		br.reset()
 	}
@@ -559,10 +587,11 @@ func initStorageNodes(addrs []string, hashSeed uint64) *storageNodesBucket {
 		sns = append(sns, sn)
 	}
 
-	maxBufSizePerStorageNode = memory.Allowed() / 8 / len(sns)
-	if maxBufSizePerStorageNode > consts.MaxInsertPacketSizeForVMInsert {
-		maxBufSizePerStorageNode = consts.MaxInsertPacketSizeForVMInsert
+	maxBufSizePerStorageNode = memory.Allowed() / 4 / len(sns)
+	if maxBufSizePerStorageNode > consts.MaxInsertBufferSize {
+		maxBufSizePerStorageNode = consts.MaxInsertBufferSize
 	}
+	logger.Infof("Insert buffer size: %d bytes", maxBufSizePerStorageNode)
 
 	metrics.RegisterSet(ms)
 	var wg sync.WaitGroup
