@@ -190,24 +190,27 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 			if chunkSize > bufLen {
 				chunk = br
 				br.reset()
+				logger.Infof("Full chunk, size=%d bytes, %d rows. Remaining %d bytes, %d rows", len(chunk.buf), chunk.rows, len(br.buf), br.rows)
 			} else {
 				// Copy rows into chunk until chunk size is reached.
 				var mr storage.MetricRow
-				src := br.buf
 				chunk.reset()
+				i := 0
 				for len(chunk.buf) < chunkSize {
-					tail, err := mr.UnmarshalX(src)
-					mr.ResetX()
+					i++
+					tail, err := mr.UnmarshalX(br.buf)
 					if err != nil {
 						logger.Panicf("BUG: cannot unmarshal MetricRow: %s", err)
 					}
-					rowBuf := src[:len(src)-len(tail)]
-					src = tail
-					chunk.buf = append(chunk.buf, rowBuf...)
+					if i%100 == 0 {
+						logger.Infof("Metric: %s", mr.String())
+					}
+					chunk.buf = mr.Marshal(chunk.buf)
+					mr.ResetX()
 					chunk.rows++
 					br.rows--
+					br.buf = tail
 				}
-				br.buf = src
 				logger.Infof("Split chunk, size=%d bytes, %d rows. Remaining %d bytes, %d rows", len(chunk.buf), chunk.rows, len(br.buf), br.rows)
 			}
 
