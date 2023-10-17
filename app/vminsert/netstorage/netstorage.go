@@ -45,9 +45,9 @@ func (sn *storageNode) isReady() bool {
 	return atomic.LoadUint32(&sn.broken) == 0 && atomic.LoadUint32(&sn.isReadOnly) == 0
 }
 
-// Returns true if the node has been unhealthy for longer than a fixed duration (30 seconds).
+// Returns true if the node has been unhealthy for longer than a fixed duration (120 seconds).
 func (sn *storageNode) isBroken() bool {
-	return !sn.isReady() && fasttime.UnixTimestamp()-atomic.LoadUint64(&sn.brokenAt) > 30
+	return !sn.isReady() && fasttime.UnixTimestamp()-atomic.LoadUint64(&sn.brokenAt) > 120
 }
 
 // push pushes buf to sn internal bufs.
@@ -179,7 +179,7 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 		br, sn.br.chunks = sn.br.chunks[0], append(sn.br.chunks[1:], br)
 		bufUtilization := float64(sn.br.len()) / float64(maxBufSizePerStorageNode)
 		if bufUtilization > 0.5 {
-			logger.Warnf("%d [%s] %.2f buffer full (%d rows, %d bytes)", snIdx, sn.dialer.Addr(), br.rows, len(br.buf), sn.br.rows(), sn.br.len(), bufUtilization)
+			logger.Warnf("%d [%s] %.2f buffer full (%d rows, %d bytes)", snIdx, sn.dialer.Addr(), bufUtilization, sn.br.rows(), sn.br.len())
 		}
 		sn.brCond.Broadcast()
 		sn.brLock.Unlock()
