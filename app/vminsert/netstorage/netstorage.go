@@ -158,8 +158,8 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 		bufLen := sn.br.len()
 		sn.brLock.Unlock()
 		waitCh = nil
-		if bufLen > 0 {
-			// Do not sleep if sn.br.buf isn't empty.
+		if bufLen > sn.br.chunkSize {
+			// Do not sleep if a full chunk is ready.
 			waitCh = closedCh
 		}
 		select {
