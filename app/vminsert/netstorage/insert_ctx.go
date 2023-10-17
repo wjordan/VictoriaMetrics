@@ -71,6 +71,9 @@ func (brc *bufChunks) push(buf []byte, rows int) {
 	if brc.chunkSize == 0 {
 		brc.chunkSize = consts.MaxInsertPacketSizeForVMInsert
 	}
+	if len(brc.chunks) == 0 {
+		brc.chunks = append(brc.chunks, bufRows{})
+	}
 	lastChunk := brc.chunks[len(brc.chunks)-1]
 	if len(brc.chunks) == 0 || len(lastChunk.buf) > brc.chunkSize {
 		lastChunk = bufRows{}

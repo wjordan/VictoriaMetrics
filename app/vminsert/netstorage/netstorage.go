@@ -175,7 +175,11 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 		sn.brLock.Unlock()
 		sn.checkHealth()
 
-		for _, chunk := range br.chunks {
+		for i, chunk := range br.chunks {
+			if len(br.chunks) > 1 {
+				logger.Infof("Sending split buffer-chunk %d, %d rows, %d bytes", i, chunk.rows, len(chunk.buf))
+			}
+
 			// Send chunk to replicas storage nodes starting from snIdx.
 			for !sendBufToReplicasNonblocking(snb, &chunk, snIdx, replicas) {
 				t := timerpool.Get(200 * time.Millisecond)
