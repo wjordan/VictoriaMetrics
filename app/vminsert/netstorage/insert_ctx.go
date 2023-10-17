@@ -8,8 +8,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/consts"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
@@ -33,13 +33,9 @@ type InsertCtx struct {
 }
 
 type bufRows struct {
-	buf  []byte
-	rows int
-}
-
-type bufChunks struct {
-	chunks    []bufRows
-	chunkSize int
+	buf           []byte
+	rows          int
+	lastResetTime uint64
 }
 
 func (br *bufRows) reset() {
@@ -60,27 +56,25 @@ func (br *bufRows) pushTo(snb *storageNodesBucket, sn *storageNode) error {
 	return nil
 }
 
-func (brc *bufChunks) reset() {
-	for _, chunk := range brc.chunks {
-		chunk.reset()
-	}
-	brc.chunks = brc.chunks[:0]
+type bufChunks struct {
+	chunks    []bufRows
+	chunkSize int
 }
 
 func (brc *bufChunks) push(buf []byte, rows int) {
-	if brc.chunkSize == 0 {
-		brc.chunkSize = consts.MaxInsertPacketSizeForVMInsert
+	var chunk *bufRows
+	for i := range brc.chunks {
+		if brc.chunkSize <= 0 || len(brc.chunks[i].buf) < brc.chunkSize {
+			chunk = &brc.chunks[i]
+			break
+		}
 	}
-	if len(brc.chunks) == 0 {
-		brc.chunks = append(brc.chunks, bufRows{})
+	if chunk == nil {
+		chunk = &bufRows{lastResetTime: fasttime.UnixTimestamp()}
+		brc.chunks = append(brc.chunks, *chunk)
 	}
-	lastChunk := brc.chunks[len(brc.chunks)-1]
-	if len(brc.chunks) == 0 || len(lastChunk.buf) > brc.chunkSize {
-		lastChunk = bufRows{}
-		brc.chunks = append(brc.chunks, lastChunk)
-	}
-	lastChunk.buf = append(lastChunk.buf, buf...)
-	lastChunk.rows += rows
+	chunk.buf = append(chunk.buf, buf...)
+	chunk.rows += rows
 }
 
 func (brc *bufChunks) len() int {

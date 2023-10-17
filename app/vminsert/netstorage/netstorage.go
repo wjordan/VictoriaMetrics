@@ -13,6 +13,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/consts"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/handshake"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
@@ -148,7 +149,8 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
-	var br bufChunks
+	var br bufRows
+	br.lastResetTime = fasttime.UnixTimestamp()
 	var waitCh <-chan struct{}
 	mustStop := false
 	for !mustStop {
@@ -169,28 +171,30 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 		case <-waitCh:
 		}
 		sn.brLock.Lock()
-		sn.br, br = br, sn.br
-		bufLen = br.len()
+		br, sn.br.chunks = sn.br.chunks[0], append(sn.br.chunks[1:], br)
 		sn.brCond.Broadcast()
 		sn.brLock.Unlock()
+		currentTime := fasttime.UnixTimestamp()
+		if len(br.buf) < cap(br.buf)/4 && currentTime-br.lastResetTime > 10 {
+			// Free up capacity space occupied by br.buf in order to reduce memory usage after spikes.
+			br.buf = append(br.buf[:0:0], br.buf...)
+			br.lastResetTime = currentTime
+		}
 		sn.checkHealth()
-
-		for i, chunk := range br.chunks {
-			if len(br.chunks) > 1 {
-				logger.Infof("Sending split buffer-chunk %d, %d rows, %d bytes", i, chunk.rows, len(chunk.buf))
-			}
-
-			// Send chunk to replicas storage nodes starting from snIdx.
-			for !sendBufToReplicasNonblocking(snb, &chunk, snIdx, replicas) {
-				t := timerpool.Get(200 * time.Millisecond)
-				select {
-				case <-sn.stopCh:
-					timerpool.Put(t)
-					return
-				case <-t.C:
-					timerpool.Put(t)
-					sn.checkHealth()
-				}
+		if len(br.buf) == 0 {
+			// Nothing to send.
+			continue
+		}
+		// Send br to replicas storage nodes starting from snIdx.
+		for !sendBufToReplicasNonblocking(snb, &br, snIdx, replicas) {
+			t := timerpool.Get(200 * time.Millisecond)
+			select {
+			case <-sn.stopCh:
+				timerpool.Put(t)
+				return
+			case <-t.C:
+				timerpool.Put(t)
+				sn.checkHealth()
 			}
 		}
 		br.reset()
@@ -528,6 +532,11 @@ func initStorageNodes(addrs []string, hashSeed uint64) *storageNodesBucket {
 			rowsReroutedFromHere:  ms.NewCounter(fmt.Sprintf(`vm_rpc_rows_rerouted_from_here_total{name="vminsert", addr=%q}`, addr)),
 			rowsReroutedToHere:    ms.NewCounter(fmt.Sprintf(`vm_rpc_rows_rerouted_to_here_total{name="vminsert", addr=%q}`, addr)),
 			sendDurationSeconds:   ms.NewFloatCounter(fmt.Sprintf(`vm_rpc_send_duration_seconds_total{name="vminsert", addr=%q}`, addr)),
+
+			br: bufChunks{
+				chunks:    []bufRows{{lastResetTime: fasttime.UnixTimestamp()}},
+				chunkSize: consts.MaxInsertPacketSizeForVMInsert,
+			},
 		}
 		sn.brCond = sync.NewCond(&sn.brLock)
 		_ = ms.NewGauge(fmt.Sprintf(`vm_rpc_rows_pending{name="vminsert", addr=%q}`, addr), func() float64 {
@@ -558,7 +567,7 @@ func initStorageNodes(addrs []string, hashSeed uint64) *storageNodesBucket {
 	if maxBufSizePerStorageNode > consts.MaxInsertBufferSize {
 		maxBufSizePerStorageNode = consts.MaxInsertBufferSize
 	}
-	logger.Infof("Insert buffer size: %d bytes", maxBufSizePerStorageNode)
+	logger.Infof("Max insert buffer per storage node: %d bytes", maxBufSizePerStorageNode)
 
 	metrics.RegisterSet(ms)
 	var wg sync.WaitGroup
