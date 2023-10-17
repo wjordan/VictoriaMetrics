@@ -8,6 +8,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/relabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/consts"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
@@ -67,8 +68,11 @@ func (brc *bufChunks) reset() {
 }
 
 func (brc *bufChunks) push(buf []byte, rows int) {
+	if brc.chunkSize == 0 {
+		brc.chunkSize = consts.MaxInsertPacketSizeForVMInsert
+	}
 	lastChunk := brc.chunks[len(brc.chunks)-1]
-	if len(brc.chunks) == 0 || (brc.chunkSize > 0 && len(lastChunk.buf) > brc.chunkSize) {
+	if len(brc.chunks) == 0 || len(lastChunk.buf) > brc.chunkSize {
 		lastChunk = bufRows{}
 		brc.chunks = append(brc.chunks, lastChunk)
 	}
