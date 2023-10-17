@@ -152,7 +152,7 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 	}()
 	defer sn.readOnlyCheckerWG.Wait()
 
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	var br bufRows
 	br.lastResetTime = fasttime.UnixTimestamp()
@@ -177,6 +177,10 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 		}
 		sn.brLock.Lock()
 		br, sn.br.chunks = sn.br.chunks[0], append(sn.br.chunks[1:], br)
+		bufUtilization := float64(sn.br.len()) / float64(maxBufSizePerStorageNode)
+		if bufUtilization > 0.5 {
+			logger.Warnf("%d [%s] %.2f buffer full (%d rows, %d bytes)", snIdx, sn.dialer.Addr(), br.rows, len(br.buf), sn.br.rows(), sn.br.len(), bufUtilization)
+		}
 		sn.brCond.Broadcast()
 		sn.brLock.Unlock()
 		currentTime := fasttime.UnixTimestamp()
@@ -203,6 +207,7 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 			}
 		}
 		br.reset()
+		ticker.Reset(500 * time.Millisecond)
 	}
 }
 
