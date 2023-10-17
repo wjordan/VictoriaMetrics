@@ -36,6 +36,11 @@ type bufRows struct {
 	rows int
 }
 
+type bufChunks struct {
+	chunks    []bufRows
+	chunkSize int
+}
+
 func (br *bufRows) reset() {
 	br.buf = br.buf[:0]
 	br.rows = 0
@@ -52,6 +57,39 @@ func (br *bufRows) pushTo(snb *storageNodesBucket, sn *storageNode) error {
 		}
 	}
 	return nil
+}
+
+func (brc *bufChunks) reset() {
+	for _, chunk := range brc.chunks {
+		chunk.reset()
+	}
+	brc.chunks = brc.chunks[:0]
+}
+
+func (brc *bufChunks) push(buf []byte, rows int) {
+	lastChunk := brc.chunks[len(brc.chunks)-1]
+	if len(brc.chunks) == 0 || (brc.chunkSize > 0 && len(lastChunk.buf) > brc.chunkSize) {
+		lastChunk = bufRows{}
+		brc.chunks = append(brc.chunks, lastChunk)
+	}
+	lastChunk.buf = append(lastChunk.buf, buf...)
+	lastChunk.rows += rows
+}
+
+func (brc *bufChunks) len() int {
+	sum := 0
+	for _, chunk := range brc.chunks {
+		sum += len(chunk.buf)
+	}
+	return sum
+}
+
+func (brc *bufChunks) rows() int {
+	sum := 0
+	for _, chunk := range brc.chunks {
+		sum += chunk.rows
+	}
+	return sum
 }
 
 // Reset resets ctx.

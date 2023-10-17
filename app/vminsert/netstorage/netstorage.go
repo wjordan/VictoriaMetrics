@@ -13,7 +13,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/consts"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/handshake"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
@@ -104,10 +103,9 @@ again:
 		}
 		return nil
 	}
-	if len(sn.br.buf)+len(buf) <= maxBufSizePerStorageNode {
+	if sn.br.len()+len(buf) <= maxBufSizePerStorageNode {
 		// Fast path: the buf contents fits sn.buf.
-		sn.br.buf = append(sn.br.buf, buf...)
-		sn.br.rows += rows
+		sn.br.push(buf, rows)
 		sn.brLock.Unlock()
 		return nil
 	}
@@ -150,14 +148,12 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
-	var br bufRows
-	var chunk bufRows
-	brLastResetTime := fasttime.UnixTimestamp()
+	var br bufChunks
 	var waitCh <-chan struct{}
 	mustStop := false
 	for !mustStop {
 		sn.brLock.Lock()
-		bufLen := len(sn.br.buf)
+		bufLen := sn.br.len()
 		sn.brLock.Unlock()
 		waitCh = nil
 		if bufLen > 0 {
@@ -174,46 +170,12 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 		}
 		sn.brLock.Lock()
 		sn.br, br = br, sn.br
-		bufLen = len(br.buf)
+		bufLen = br.len()
 		sn.brCond.Broadcast()
 		sn.brLock.Unlock()
-		currentTime := fasttime.UnixTimestamp()
-		if bufLen < cap(br.buf)/4 && currentTime-brLastResetTime > 10 {
-			// Free up capacity space occupied by br.buf in order to reduce memory usage after spikes.
-			br.buf = append(br.buf[:0:0], br.buf...)
-			brLastResetTime = currentTime
-		}
 		sn.checkHealth()
-		// Split buf into chunks.
-		chunkSize := consts.MaxInsertPacketSizeForVMInsert
-		for bufLen > 0 {
-			if chunkSize > bufLen {
-				chunk = br
-				br.reset()
-				logger.Infof("Full chunk, size=%d bytes, %d rows. Remaining %d bytes, %d rows", len(chunk.buf), chunk.rows, len(br.buf), br.rows)
-			} else {
-				// Copy rows into chunk until chunk size is reached.
-				var mr storage.MetricRow
-				chunk.reset()
-				i := 0
-				for len(chunk.buf) < chunkSize {
-					i++
-					tail, err := mr.UnmarshalX(br.buf)
-					if err != nil {
-						logger.Panicf("BUG: cannot unmarshal MetricRow: %s", err)
-					}
-					if i%100 == 0 {
-						logger.Infof("Metric: %s", mr.String())
-					}
-					chunk.buf = mr.Marshal(chunk.buf)
-					mr.ResetX()
-					chunk.rows++
-					br.rows--
-					br.buf = tail
-				}
-				logger.Infof("Split chunk, size=%d bytes, %d rows. Remaining %d bytes, %d rows", len(chunk.buf), chunk.rows, len(br.buf), br.rows)
-			}
 
+		for _, chunk := range br.chunks {
 			// Send chunk to replicas storage nodes starting from snIdx.
 			for !sendBufToReplicasNonblocking(snb, &chunk, snIdx, replicas) {
 				t := timerpool.Get(200 * time.Millisecond)
@@ -226,8 +188,6 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 					sn.checkHealth()
 				}
 			}
-			chunk.reset()
-			bufLen = len(br.buf)
 		}
 		br.reset()
 	}
@@ -447,7 +407,7 @@ type storageNode struct {
 
 	// Buffer with data that needs to be written to the storage node.
 	// It must be accessed under brLock.
-	br bufRows
+	br bufChunks
 
 	// bcLock protects bc.
 	bcLock sync.Mutex
@@ -568,13 +528,13 @@ func initStorageNodes(addrs []string, hashSeed uint64) *storageNodesBucket {
 		sn.brCond = sync.NewCond(&sn.brLock)
 		_ = ms.NewGauge(fmt.Sprintf(`vm_rpc_rows_pending{name="vminsert", addr=%q}`, addr), func() float64 {
 			sn.brLock.Lock()
-			n := sn.br.rows
+			n := sn.br.rows()
 			sn.brLock.Unlock()
 			return float64(n)
 		})
 		_ = ms.NewGauge(fmt.Sprintf(`vm_rpc_buf_pending_bytes{name="vminsert", addr=%q}`, addr), func() float64 {
 			sn.brLock.Lock()
-			n := len(sn.br.buf)
+			n := sn.br.len()
 			sn.brLock.Unlock()
 			return float64(n)
 		})
@@ -788,9 +748,8 @@ func getNotReadyStorageNodeIdxs(snb *storageNodesBucket, dst []int, snExtra *sto
 func (sn *storageNode) trySendBuf(buf []byte, rows int) bool {
 	sent := false
 	sn.brLock.Lock()
-	if sn.isReady() && len(sn.br.buf)+len(buf) <= maxBufSizePerStorageNode {
-		sn.br.buf = append(sn.br.buf, buf...)
-		sn.br.rows += rows
+	if sn.isReady() && sn.br.len()+len(buf) <= maxBufSizePerStorageNode {
+		sn.br.push(buf, rows)
 		sent = true
 	}
 	sn.brLock.Unlock()
@@ -799,7 +758,7 @@ func (sn *storageNode) trySendBuf(buf []byte, rows int) bool {
 
 func (sn *storageNode) sendBufMayBlock(buf []byte) bool {
 	sn.brLock.Lock()
-	for len(sn.br.buf)+len(buf) > maxBufSizePerStorageNode {
+	for sn.br.len()+len(buf) > maxBufSizePerStorageNode {
 		select {
 		case <-sn.stopCh:
 			sn.brLock.Unlock()
@@ -808,8 +767,7 @@ func (sn *storageNode) sendBufMayBlock(buf []byte) bool {
 		}
 		sn.brCond.Wait()
 	}
-	sn.br.buf = append(sn.br.buf, buf...)
-	sn.br.rows++
+	sn.br.push(buf, 1)
 	sn.brLock.Unlock()
 	return true
 }
