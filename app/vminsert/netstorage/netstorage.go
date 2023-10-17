@@ -202,45 +202,33 @@ func (sn *storageNode) run(snb *storageNodesBucket, snIdx int) {
 }
 
 func sendBufToReplicasNonblocking(snb *storageNodesBucket, br *bufRows, snIdx, replicas int) bool {
-	usedStorageNodes := make(map[*storageNode]struct{}, replicas)
 	sns := snb.sns
+	failures := 0
 	for i := 0; i < replicas; i++ {
 		idx := snIdx + i
-		attempts := 0
-		for {
-			attempts++
-			if attempts > len(sns) {
-				if i == 0 {
-					// The data wasn't replicated at all.
-					cannotReplicateLogger.Warnf("cannot push %d bytes with %d rows to storage nodes, since all the nodes are temporarily unavailable; "+
-						"re-trying to send the data soon", len(br.buf), br.rows)
-					return false
-				}
-				// The data is partially replicated, so just emit a warning and return true.
-				// We could retry sending the data again, but this may result in uncontrolled duplicate data.
-				// So it is better returning true.
-				rowsIncompletelyReplicatedTotal.Add(br.rows)
-				incompleteReplicationLogger.Warnf("cannot make a copy #%d out of %d copies according to -replicationFactor=%d for %d bytes with %d rows, "+
-					"since a part of storage nodes is temporarily unavailable", i+1, replicas, *replicationFactor, len(br.buf), br.rows)
-				return true
-			}
-			if idx >= len(sns) {
-				idx %= len(sns)
-			}
-			sn := sns[idx]
-			idx++
-			if _, ok := usedStorageNodes[sn]; ok {
-				// The br has been already replicated to sn. Skip it.
-				continue
-			}
-			if !sn.sendBufRowsNonblocking(br) {
-				// Cannot send data to sn. Go to the next sn.
-				continue
-			}
-			// Successfully sent data to sn.
-			usedStorageNodes[sn] = struct{}{}
-			break
+		if idx >= len(sns) {
+			idx %= len(sns)
 		}
+		sn := sns[idx]
+		idx++
+		if !sn.sendBufRowsNonblocking(br) {
+			// Cannot send data to sn, mark failure.
+			failures++
+		}
+	}
+	if failures >= replicas {
+		// The data wasn't replicated at all.
+		cannotReplicateLogger.Warnf("cannot push %d bytes with %d rows to storage nodes, since all the nodes are temporarily unavailable; "+
+			"re-trying to send the data soon", len(br.buf), br.rows)
+		return false
+	} else if failures > 0 {
+		// The data is partially replicated, so just emit a warning and return true.
+		// We could retry sending the data again, but this may result in uncontrolled duplicate data.
+		// So it is better returning true.
+		rowsIncompletelyReplicatedTotal.Add(br.rows)
+		incompleteReplicationLogger.Warnf("cannot make %d out of %d copies according to -replicationFactor=%d for %d bytes with %d rows, "+
+			"since a part of storage nodes is temporarily unavailable", failures, replicas, *replicationFactor, len(br.buf), br.rows)
+		return true
 	}
 	return true
 }
@@ -761,7 +749,7 @@ func getNotReadyStorageNodeIdxs(snb *storageNodesBucket, dst []int, snExtra *sto
 func (sn *storageNode) trySendBuf(buf []byte, rows int) bool {
 	sent := false
 	sn.brLock.Lock()
-	if sn.isReady() && sn.br.len()+len(buf) <= maxBufSizePerStorageNode {
+	if /*sn.isReady() &&*/ sn.br.len()+len(buf) <= maxBufSizePerStorageNode {
 		sn.br.push(buf, rows)
 		sent = true
 	}
