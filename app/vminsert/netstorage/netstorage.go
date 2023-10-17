@@ -45,6 +45,11 @@ func (sn *storageNode) isReady() bool {
 	return atomic.LoadUint32(&sn.broken) == 0 && atomic.LoadUint32(&sn.isReadOnly) == 0
 }
 
+// Returns true if the node has been unhealthy for longer than a fixed duration (30 seconds).
+func (sn *storageNode) isBroken() bool {
+	return !sn.isReady() && fasttime.UnixTimestamp()-atomic.LoadUint64(&sn.brokenAt) > 30
+}
+
 // push pushes buf to sn internal bufs.
 //
 // This function doesn't block on fast path.
@@ -89,7 +94,7 @@ again:
 		return fmt.Errorf("cannot send %d rows because of graceful shutdown", rows)
 	default:
 	}
-	if !sn.isReady() {
+	if sn.isBroken() {
 		if len(sns) == 1 {
 			// There are no other storage nodes to re-route to. So wait until the current node becomes healthy.
 			sn.brCond.Wait()
@@ -249,6 +254,7 @@ func (sn *storageNode) checkHealth() {
 	bc, err := sn.dial()
 	if err != nil {
 		atomic.StoreUint32(&sn.broken, 1)
+		atomic.StoreUint64(&sn.brokenAt, fasttime.UnixTimestamp())
 		sn.brCond.Broadcast()
 		if sn.lastDialErr == nil {
 			// Log the error only once.
@@ -302,6 +308,7 @@ func (sn *storageNode) sendBufRowsNonblocking(br *bufRows) bool {
 	}
 	sn.bc = nil
 	atomic.StoreUint32(&sn.broken, 1)
+	atomic.StoreUint64(&sn.brokenAt, fasttime.UnixTimestamp())
 	sn.brCond.Broadcast()
 	sn.connectionErrors.Inc()
 	return false
@@ -390,6 +397,9 @@ type storageNode struct {
 	// broken is set to non-zero if the given vmstorage node is temporarily unhealthy.
 	// In this case the data is re-routed to the remaining healthy vmstorage nodes.
 	broken uint32
+
+	// brokenAt is the time when the vmstorage node first became unhealthy.
+	brokenAt uint64
 
 	// isReadOnly is set to non-zero if the given vmstorage node is read only
 	// In this case the data is re-routed to the remaining healthy vmstorage nodes.
@@ -818,6 +828,7 @@ func (sn *storageNode) checkReadOnlyMode() {
 	}
 	sn.bc = nil
 	atomic.StoreUint32(&sn.broken, 1)
+	atomic.StoreUint64(&sn.brokenAt, fasttime.UnixTimestamp())
 	sn.brCond.Broadcast()
 	sn.connectionErrors.Inc()
 }
